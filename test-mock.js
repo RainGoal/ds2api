@@ -30,6 +30,24 @@ const SSE_BODY =
   'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n' +
   'event: close\ndata: {}\n\n';
 
+// 工具调用应答：正文 + 两个并行 Bash 调用（DSML 标记）
+const DSML_CALL_BLOCK =
+  '<｜｜DSML｜｜ calls>\n' +
+  '<｜｜DSML｜｜ invoke name="Bash">\n' +
+  '<｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜DSML｜｜ parameter>\n' +
+  '</｜｜DSML｜｜ invoke>\n' +
+  '<｜｜DSML｜｜ invoke name="Bash">\n' +
+  '<｜｜DSML｜｜ parameter name="command" string="true">git log --oneline</｜｜DSML｜｜ parameter>\n' +
+  '</｜｜DSML｜｜ invoke>\n' +
+  '</｜｜DSML｜｜ calls>';
+
+const SSE_TOOL_BODY =
+  'event: ready\ndata: {"request_message_id":1,"response_message_id":2,"model_type":"default"}\n\n' +
+  'data: {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"我先看下目录。\\n"}]}\n\n' +
+  'data: {"p":"response/fragments/-1/content","o":"APPEND","v":' + JSON.stringify(DSML_CALL_BLOCK) + '}\n\n' +
+  'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n' +
+  'event: close\ndata: {}\n\n';
+
 let lastPayload = null; // 记录上游收到的 completion body，供开关断言
 
 function okEnvelope(bizData) {
@@ -73,7 +91,7 @@ const mock = http.createServer((req, res) => {
         'content-type': 'text/event-stream; charset=utf-8',
         'transfer-encoding': 'chunked',
       });
-      res.write(SSE_BODY);
+      res.write(payload.prompt.includes('DSML_CALL_TEST') ? SSE_TOOL_BODY : SSE_BODY);
       setTimeout(() => res.end(), 50);
       return;
     }
@@ -184,6 +202,87 @@ async function main() {
     await resp3.json();
     assert.strictEqual(lastPayload.thinking_enabled, false, 'thinking.type=disabled 应关闭思考');
     console.log('[PASS] thinking:{type:"disabled"} 写法识别');
+
+    const bashTool = {
+      type: 'function',
+      function: {
+        name: 'Bash',
+        description: 'run a shell command',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      },
+    };
+
+    // 4. 工具调用（非流式）：DSML 标记 → tool_calls，tools 注入 prompt
+    const resp4 = await fetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'DSML_CALL_TEST 看下目录' }],
+        tools: [bashTool],
+      }),
+    });
+    const json4 = await resp4.json();
+    assert.strictEqual(json4.choices[0].finish_reason, 'tool_calls', 'finish_reason 应为 tool_calls');
+    const tcs = json4.choices[0].message.tool_calls;
+    assert.ok(Array.isArray(tcs) && tcs.length === 2, `应解析出两个并行工具调用，实际 ${tcs && tcs.length}`);
+    assert.strictEqual(tcs[0].function.name, 'Bash');
+    assert.deepStrictEqual(JSON.parse(tcs[0].function.arguments), { command: 'ls -la' });
+    assert.deepStrictEqual(JSON.parse(tcs[1].function.arguments), { command: 'git log --oneline' });
+    assert.ok(tcs[0].id.startsWith('call_'), 'tool_call id 不合规');
+    assert.ok(!String(json4.choices[0].message.content || '').includes('DSML'), 'DSML 标记不应出现在正文');
+    assert.ok(lastPayload.prompt.includes('<｜｜DSML｜｜ calls>'), '工具格式说明未注入 prompt');
+    assert.ok(lastPayload.prompt.includes('"Bash"'), 'tool schema 未注入 prompt');
+    console.log('[PASS] 工具调用（非流式，并行调用 + tools 注入 prompt）');
+
+    // 5. 工具调用（流式）：标记不泄漏成 content 增量，tool_calls 增量收尾
+    const resp5 = await fetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        stream: true,
+        messages: [{ role: 'user', content: 'DSML_CALL_TEST 流式看目录' }],
+        tools: [bashTool],
+      }),
+    });
+    const text5 = await resp5.text();
+    assert.ok(text5.includes('"tool_calls"'), '缺少 tool_calls 增量');
+    assert.ok(text5.includes('"finish_reason":"tool_calls"'), 'finish_reason 应为 tool_calls');
+    assert.ok(text5.includes('ls -la'), 'tool_calls 参数缺失');
+    assert.ok(text5.includes('我先看下目录'), '调用前的正文缺失');
+    assert.ok(!text5.includes('DSML'), 'DSML 标记不应泄漏到输出');
+    assert.ok(text5.trimEnd().endsWith('data: [DONE]'), '缺少 [DONE] 结尾');
+    console.log('[PASS] 工具调用（流式，标记不泄漏）');
+
+    // 6. 多轮历史：assistant.tool_calls 与 tool 结果回填 prompt
+    const resp6 = await fetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-key' },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        messages: [
+          { role: 'user', content: 'DSML_CALL_TEST 列目录' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'Bash', arguments: '{"command":"ls"}' } }],
+          },
+          { role: 'tool', tool_call_id: 'call_1', name: 'Bash', content: 'README.md\nserver.js' },
+          { role: 'user', content: '继续' },
+        ],
+        tools: [bashTool],
+      }),
+    });
+    await resp6.json();
+    assert.ok(lastPayload.prompt.includes('Tool result (Bash):'), 'tool 结果未渲染进 prompt');
+    assert.ok(lastPayload.prompt.includes('README.md'), 'tool 结果内容缺失');
+    assert.ok(lastPayload.prompt.includes('invoke name="Bash"'), '历史 tool_calls 未渲染进 prompt');
+    console.log('[PASS] 多轮历史（tool_calls / tool 结果回填）');
 
     console.log('集成测试全部通过 ✔');
   } finally {

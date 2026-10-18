@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { DeepSeekClient, UpstreamError } = require('./lib/dsweb');
+const { parseToolCalls, holdIndex, renderToolsSection, renderCallsBlock } = require('./lib/tools');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const PID_PATH = path.join(__dirname, 'server.pid');
@@ -136,23 +137,38 @@ function textOf(msg) {
   return '';
 }
 
-function buildPrompt(messages) {
-  const usable = messages.filter((m) => m && (m.role === 'system' || m.role === 'user' || m.role === 'assistant'));
+function buildPrompt(messages, toolsSection) {
+  const usable = messages.filter(
+    (m) => m && (m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool')
+  );
   if (usable.length === 0) throw new HttpError(400, 'messages 不能为空');
 
-  // 仅一条用户消息且无系统提示时原样透传（保持网页端单轮体验）
-  if (usable.length === 1 && usable[0].role === 'user') return textOf(usable[0]);
-
-  const parts = [];
-  const systemText = usable.filter((m) => m.role === 'system').map(textOf).filter(Boolean).join('\n');
-  if (systemText) parts.push(`System:\n${systemText}`);
-  for (const m of usable) {
-    if (m.role === 'system') continue;
-    const label = m.role === 'user' ? 'User' : 'Assistant';
-    const text = textOf(m);
-    if (text) parts.push(`${label}:\n${text}`);
+  let conv;
+  if (usable.length === 1 && usable[0].role === 'user') {
+    // 仅一条用户消息且无系统提示时原样透传（保持网页端单轮体验）
+    conv = textOf(usable[0]);
+  } else {
+    const parts = [];
+    const systemText = usable.filter((m) => m.role === 'system').map(textOf).filter(Boolean).join('\n');
+    if (systemText) parts.push(`System:\n${systemText}`);
+    for (const m of usable) {
+      if (m.role === 'system') continue;
+      if (m.role === 'tool') {
+        // 工具执行结果（上一轮模型发起 tool_calls 后客户端回传）
+        parts.push(`Tool result (${m.name || m.tool_call_id || 'tool'}):\n${textOf(m)}`);
+        continue;
+      }
+      // assistant 的 tool_calls 渲染回 DSML 标记，保持模型看到自己上次的调用
+      const segs = [textOf(m)];
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        segs.push(renderCallsBlock(m.tool_calls));
+      }
+      const text = segs.filter(Boolean).join('\n');
+      if (text.trim()) parts.push(`${m.role === 'user' ? 'User' : 'Assistant'}:\n${text}`);
+    }
+    conv = parts.join('\n\n');
   }
-  return parts.join('\n\n');
+  return toolsSection ? `${conv}\n\n${toolsSection}` : conv;
 }
 
 // ---------- 用量估算（网页端不返回精确用量） ----------
@@ -252,8 +268,14 @@ async function handleChatCompletions(req, res) {
   if (!Array.isArray(body.messages)) throw new HttpError(400, '缺少 messages 数组');
   const model = body.model || MODEL_ID;
   const stream = !!body.stream;
-  const prompt = buildPrompt(body.messages);
   const { thinking, search } = resolveFlags(body);
+
+  // 工具调用：把 tools 渲染进提示词；tool_choice=none 则不注入也不识别调用标记
+  const toolChoice = body.tool_choice;
+  const noTools = toolChoice === 'none' || toolChoice?.type === 'none';
+  const toolsArr = Array.isArray(body.tools) ? body.tools : [];
+  const toolsSection = toolsArr.length && !noTools ? renderToolsSection(toolsArr, toolChoice) : null;
+  const prompt = buildPrompt(body.messages, toolsSection);
 
   if (!cfg.token) {
     throw new HttpError(
@@ -300,6 +322,7 @@ async function handleChatCompletions(req, res) {
 
     try {
       chunk({ role: 'assistant', content: '' });
+      let emitted = 0; // 已作为正文增量发出的 content 前缀长度
       for await (const ev of gen) {
         if (ev.kind === 'delta') {
           if (ev.type === 'reasoning') {
@@ -307,13 +330,34 @@ async function handleChatCompletions(req, res) {
             chunk({ reasoning_content: ev.text });
           } else {
             content += ev.text;
-            chunk({ content: ev.text });
+            // 工具调用标记（含未定形的尾部前缀）先扣住，避免泄漏成正文
+            const safe = noTools ? content.length : holdIndex(content);
+            if (safe > emitted) {
+              chunk({ content: content.slice(emitted, safe) });
+              emitted = safe;
+            }
           }
         } else if (ev.kind === 'done') {
           usageUpstream = ev.usage;
         }
       }
-      chunk({}, 'stop');
+      // 收尾：补发扣住的正文，再把工具调用以 tool_calls 增量发出
+      const calls = [];
+      if (!noTools) {
+        const tail = parseToolCalls(content.slice(emitted)).text;
+        if (tail) chunk({ content: tail });
+        calls.push(...parseToolCalls(content).calls);
+      }
+      if (calls.length) {
+        calls.forEach((c, i) =>
+          chunk({
+            tool_calls: [{ index: i, id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }],
+          })
+        );
+        chunk({}, 'tool_calls');
+      } else {
+        chunk({}, 'stop');
+      }
       res.write(
         `data: ${JSON.stringify({
           id,
@@ -343,6 +387,12 @@ async function handleChatCompletions(req, res) {
           usageUpstream = ev.usage;
         }
       }
+      const parsed = noTools ? { text: content, calls: [] } : parseToolCalls(content);
+      const toolCalls = parsed.calls.map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.name, arguments: c.arguments },
+      }));
       sendJson(res, 200, {
         id,
         object: 'chat.completion',
@@ -353,10 +403,11 @@ async function handleChatCompletions(req, res) {
             index: 0,
             message: {
               role: 'assistant',
-              content,
+              content: toolCalls.length ? parsed.text || null : parsed.text,
               ...(reasoning ? { reasoning_content: reasoning } : {}),
+              ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
             },
-            finish_reason: 'stop',
+            finish_reason: toolCalls.length ? 'tool_calls' : 'stop',
           },
         ],
         usage: buildUsage(prompt, content + reasoning, usageUpstream),
@@ -367,7 +418,7 @@ async function handleChatCompletions(req, res) {
   }
   log(
     `${req.method} /v1/chat/completions model=${model} stream=${stream} thinking=${thinking} search=${search} ` +
-      `${Date.now() - started}ms len(content)=${content.length}${extraFieldsOf(body)}`
+      `tools=${toolsArr.length} ${Date.now() - started}ms len(content)=${content.length}${extraFieldsOf(body)}`
   );
 }
 

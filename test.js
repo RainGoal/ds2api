@@ -8,6 +8,7 @@
 const assert = require('assert');
 const { solveChallenge, loadWasm, wasmSolve } = require('./lib/pow');
 const { SseParser, StreamState } = require('./lib/dsweb');
+const { parseToolCalls, holdIndex, renderCallsBlock } = require('./lib/tools');
 
 function parseAll(text) {
   const parser = new SseParser();
@@ -111,6 +112,62 @@ async function main() {
     /frequently/
   );
   console.log('[PASS] toast 错误识别');
+
+  // 8. 工具调用解析：DSML 标记 → tool_calls（含并行调用与非字符串参数）
+  const callText =
+    '我先看下目录。\n' +
+    '<｜｜DSML｜｜ calls>\n' +
+    '<｜｜DSML｜｜ invoke name="Bash">\n' +
+    '<｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜DSML｜｜ parameter>\n' +
+    '<｜｜DSML｜｜ parameter name="timeout" >60</｜｜DSML｜｜ parameter>\n' +
+    '</｜｜DSML｜｜ invoke>\n' +
+    '<｜｜DSML｜｜ invoke name="Read">\n' +
+    '<｜｜DSML｜｜ parameter name="file_path" string="true">D:\\a\\b.txt</｜｜DSML｜｜ parameter>\n' +
+    '</｜｜DSML｜｜ invoke>\n' +
+    '</｜｜DSML｜｜ calls>';
+  const parsed = parseToolCalls(callText);
+  assert.strictEqual(parsed.text, '我先看下目录。');
+  assert.strictEqual(parsed.calls.length, 2);
+  assert.strictEqual(parsed.calls[0].name, 'Bash');
+  assert.deepStrictEqual(JSON.parse(parsed.calls[0].arguments), { command: 'ls -la', timeout: 60 });
+  assert.strictEqual(parsed.calls[1].name, 'Read');
+  assert.deepStrictEqual(JSON.parse(parsed.calls[1].arguments), { file_path: 'D:\\a\\b.txt' });
+  // 无调用时正文原样返回
+  assert.strictEqual(parseToolCalls('普通回答 1+1=2').text, '普通回答 1+1=2');
+  console.log('[PASS] 工具调用解析（DSML → tool_calls）');
+
+  // 9. 闭合标签另一种写法 <｜｜DSML｜｜ /invoke> 与未闭合截断抢救
+  const alt = parseToolCalls(
+    '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="Bash"><｜｜DSML｜｜ parameter name="c" string="true">x<｜｜DSML｜｜ /parameter><｜｜DSML｜｜ /invoke><｜｜DSML｜｜ /calls>'
+  );
+  assert.strictEqual(alt.calls.length, 1);
+  assert.deepStrictEqual(JSON.parse(alt.calls[0].arguments), { c: 'x' });
+  const truncated = parseToolCalls(
+    '前文<｜｜DSML｜｜ invoke name="Bash"><｜｜DSML｜｜ parameter name="command" string="true">ls -la'
+  );
+  assert.strictEqual(truncated.text, '前文');
+  assert.strictEqual(truncated.calls.length, 1);
+  assert.deepStrictEqual(JSON.parse(truncated.calls[0].arguments), { command: 'ls -la' });
+  console.log('[PASS] 工具调用解析（兼容闭合写法 / 截断抢救）');
+
+  // 10. holdIndex：标记定形前扣住正文，防止 DSML 泄漏成 content
+  assert.strictEqual(holdIndex('你好'), 2);
+  assert.strictEqual(holdIndex('你好<'), 2);
+  assert.strictEqual(holdIndex('你好<｜｜DSML'), 2);
+  assert.strictEqual(holdIndex('你好<｜｜DSML｜｜ invoke'), 2);
+  assert.strictEqual(holdIndex('a < b > c'), 9);
+  console.log('[PASS] 流式 holdIndex 扣住工具调用标记');
+
+  // 11. tool_calls 渲染回 DSML 往返一致（多轮历史回填）
+  const block = renderCallsBlock([
+    { id: 'call_1', type: 'function', function: { name: 'Bash', arguments: '{"command":"ls","n":2}' } },
+  ]);
+  const rt = parseToolCalls(block);
+  assert.strictEqual(rt.text, '');
+  assert.strictEqual(rt.calls.length, 1);
+  assert.strictEqual(rt.calls[0].name, 'Bash');
+  assert.deepStrictEqual(JSON.parse(rt.calls[0].arguments), { command: 'ls', n: 2 });
+  console.log('[PASS] tool_calls 渲染往返一致');
 
   console.log('全部自测通过 ✔');
 }

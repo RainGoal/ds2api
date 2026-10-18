@@ -120,7 +120,8 @@ ds2api 已注册为 ZCode 的模型供应商（providerId `new-provider-ds2api`�
    `THINK` 片段 → `reasoning_content`，`RESPONSE` 片段 → `content`，`status=FINISHED` 收尾
 4. **OpenAI 层**：`server.js` 把以上包装成 `/v1/chat/completions`（流式 / 非流式），
    思考 / 搜索开关从请求字段（`reasoning_effort` 等）或 config 默认值映射到
-   `thinking_enabled` / `search_enabled`
+   `thinking_enabled` / `search_enabled`；`tools` 注入提示词、模型的 DSML 工具调用
+   标记在 `lib/tools.js` 解析回 `tool_calls`
 
 改动后跑自测：`node test.js`（PoW 实测向量 + SSE 协议单测）、
 `node test-mock.js`（mock 上游全链路集成测试，无需联网）。
@@ -132,6 +133,8 @@ ds2api 已注册为 ZCode 的模型供应商（providerId `new-provider-ds2api`�
 - 非官方接口，DeepSeek 改版可能失效：报 PoW / 协议类错误时，可先尝试更新
   config.json 的 `x_client_version`，或关注本项目更新
 - 返回的 `usage` 是估算值（网页端不返回精确 token 用量）
+- 工具调用是提示词层面的模拟（网页端无原生 function calling）：偶发不按格式发起
+  调用时可让提示词更明确（如「用 XX 工具完成」），或重试一次
 - 仅建议单人本地使用；不要暴露到公网（config.json 的 `api_key` 是唯一防线）
 
 ## API 说明
@@ -140,7 +143,7 @@ ds2api 已注册为 ZCode 的模型供应商（providerId `new-provider-ds2api`�
 |---|---|
 | `GET /health` | 健康检查（含 token 配置状态） |
 | `GET /v1/models` | 模型列表 |
-| `POST /v1/chat/completions` | 对话补全，支持 `stream: true`（SSE）与非流式 |
+| `POST /v1/chat/completions` | 对话补全，支持 `stream: true`（SSE）、非流式与 `tools` / `tool_calls` |
 
 ### 模型与能力开关
 
@@ -155,6 +158,17 @@ ds2api 已注册为 ZCode 的模型供应商（providerId `new-provider-ds2api`�
 深度思考的输出放在 `reasoning_content` 字段（与 DeepSeek 官方 API 一致），正文在 `content`。
 
 多轮对话按 OpenAI 惯例传完整 `messages` 历史（内部会合并成单段提示词发起新会话）。
+
+### 工具调用（function calling）
+
+请求里带 `tools`（OpenAI 格式）即可让模型调用工具（本地执行 Bash、读文件等由客户端完成）：
+
+- `tools` 定义会注入提示词，模型按网页端原生的 DSML 标记发起调用，代理解析后以标准
+  `tool_calls` 字段返回（`finish_reason: "tool_calls"`，流式 / 非流式均支持，
+  标记不会泄漏成正文）
+- 客户端拿到 `tool_calls` 后本地执行，把结果以 `role: "tool"` 消息回传即可续聊；
+  `assistant.tool_calls` 与工具结果会自动回填提示词
+- `tool_choice: "none"` 不注入工具也不识别调用标记；`"required"` 或指定函数名会强制要求调用
 
 ---
 
@@ -197,7 +211,8 @@ ds2api/
 ├── config.example.json  # 配置模板
 ├── lib/
 │   ├── dsweb.js         # DeepSeek 网页协议客户端（会话/PoW/SSE 补丁流）
-│   └── pow.js           # PoW 求解（官方 sha3_wasm.wasm，已对实测向量验证）
+│   ├── tools.js         # 工具调用：DSML 标记 ⇄ OpenAI tool_calls
+│   ├── pow.js           # PoW 求解（官方 sha3_wasm.wasm，已对实测向量验证）
 │   └── sha3_wasm.wasm   # DeepSeek 网页端同款求解器（缺失时自动下载）
 ├── start.bat / stop.bat # 启动 / 停止
 ├── install-shortcuts.bat + create-shortcuts.ps1  # 生成桌面快捷方式
