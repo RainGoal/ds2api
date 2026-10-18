@@ -1,0 +1,16 @@
+{
+  "host": "127.0.0.1",
+  "port": 3210,
+  "api_key": "",
+  "token": "",
+  "base_url": "https://chat.deepseek.com",
+  "x_client_version": "2.5.0",
+  "device_id": "",
+  "thinking_enabled": true,
+  "search_enabled": false,
+  "extra_headers": {},
+  "user_agent": "",
+  "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
+  "risk_headers": true,
+  "idle_timeout_ms": 120000
+}

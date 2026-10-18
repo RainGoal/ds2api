@@ -1,0 +1,5 @@
+node_modules/
+server.pid
+*.log
+config.json
+assets/
