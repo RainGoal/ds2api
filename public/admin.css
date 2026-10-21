@@ -123,6 +123,15 @@ tbody tr:hover { background: #fcfdf8; }
 .status-badge.badge-cooldown, .status-badge.badge-rate_limited { background: var(--amber-soft); color: var(--amber); border-color: #ecdfba; }
 .status-badge.badge-invalid, .status-badge.badge-missing_token { background: var(--red-soft); color: var(--red); border-color: #edd5c9; }
 .status-badge.badge-disabled { background: #efefe9; color: #979c90; border-color: #e3e5db; }
+.status-badge.badge-health-unknown { background: #f4f0e3; color: #8d793f; border-color: #e8dfc4; }
+.status-badge.badge-health-unhealthy { background: var(--red-soft); color: var(--red); border-color: #edd5c9; }
+.health-healthy { background: #3b8053; }
+.health-unknown { background: #b39a59; }
+.health-unhealthy { background: #b96d58; }
+.health-cell { min-width: 142px; }
+.health-reason { max-width: 160px; white-space: normal; line-height: 1.7; }
+.overview-accounts-table { min-width: 800px; }
+.accounts-table { min-width: 940px; }
 .cell-subtext { color: #9aa18f; font-size: 9px; margin-top: 5px; }
 .rate-budget { font-family: var(--mono-font); font-size: 10px; color: #607454; }
 .rate-budget .muted { color: #a0a791; }

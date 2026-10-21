@@ -4,7 +4,9 @@
   const $ = (id) => document.getElementById(id);
   const state = { key: '', snapshot: null, tab: 'overview', editingId: null, logsOffset: 0, logsTotal: 0, logsTruncated: false, statusLoading: false, logsLoading: false, generation: 0 };
   const PAGE_SIZE = 30;
-  const statuses = { available: '可用', busy: '处理中', rate_limited: '频率受限', cooldown: '冷却中', invalid: '需更新凭证', missing_token: '未配置凭证', disabled: '已停用' };
+  const statuses = { available: '可用', busy: '处理中', rate_limited: '频率受限', cooldown: '冷却中', invalid: '已隔离', missing_token: '未配置凭证', disabled: '已停用' };
+  const healthStatuses = { unknown: '待验证', healthy: '正常', unhealthy: '异常' };
+  const healthReasons = { missing_token: '未配置 Token', token_expired: 'Token 已到期', authentication_failed: '凭证鉴权失败', account_muted: '账号已被禁言', verification_required: '需要完成账号验证', rate_limited: '上游限流，等待冷却', upstream_error: '上游请求异常，等待冷却', awaiting_retry: '冷却结束，等待请求验证' };
   const outcomes = { success: '成功', failed: '失败', cancelled: '已取消' };
   const errorKinds = { auth: '凭证失效', rate_limit: '上游限流', mute: '账号受限', captcha: '需要验证', upstream: '上游异常', queue_timeout: '排队超时', pool_unavailable: '无可用账号', cancelled: '请求取消' };
   const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
@@ -144,13 +146,30 @@
     if (account.status === 'cooldown' && account.cooldown_until) {
       const remaining = Math.max(0, Math.ceil((new Date(account.cooldown_until).getTime() - Date.now()) / 1000));
       cell.append(element('div', 'cell-subtext', `约 ${remaining} 秒后重试`));
+    }
+    if (typeof account.schedulable === 'boolean') {
+      cell.append(element('div', 'cell-subtext', account.schedulable ? '当前可调度' : '当前暂停调度'));
     } else if (account.status === 'invalid') {
       const reason = account.invalid_reason;
-      const reasonText = reason && Object.hasOwn(errorKinds, reason) ? errorKinds[reason] : '请更新凭证或处理账号验证';
-      cell.append(element('div', 'cell-subtext', reasonText));
-    } else if (account.token_expires_at) {
-      cell.append(element('div', 'cell-subtext', `到期 ${formatTime(account.token_expires_at, false)}`));
+      const reasonText = reason && (healthReasons[reason] || errorKinds[reason]);
+      cell.append(element('div', 'cell-subtext', reasonText || '请更新凭证或处理账号验证'));
     }
+    if (account.token_expires_at) cell.title = `Token 到期：${formatTime(account.token_expires_at)}`;
+    return cell;
+  }
+
+  function healthCell(account) {
+    const health = Object.hasOwn(healthStatuses, account.health_status) ? account.health_status : 'unknown';
+    const cell = element('td', 'health-cell');
+    const badge = element('span', `status-badge badge-health-${health}`);
+    badge.append(element('i', `legend-dot health-${health}`), document.createTextNode(healthStatuses[health]));
+    const reason = account.health_reason || (health === 'unhealthy' ? account.invalid_reason : null);
+    const fallback = { unknown: '等待请求验证', healthy: '最近请求成功', unhealthy: '最近请求异常' };
+    const reasonText = reason && Object.hasOwn(healthReasons, reason) ? healthReasons[reason] : fallback[health];
+    const checked = account.last_checked_at ? `最近验证：${formatTime(account.last_checked_at)}` : '尚无请求验证结果';
+    cell.title = checked;
+    badge.title = checked;
+    cell.append(badge, element('div', 'cell-subtext health-reason', reasonText));
     return cell;
   }
 
@@ -195,10 +214,10 @@
     const body = $(bodyId);
     body.replaceChildren();
     const list = accounts();
-    if (!list.length) { emptyRow(body, withActions ? 6 : 5, '号池中还没有账号。在“账号管理”中添加第一个账号。'); return; }
+    if (!list.length) { emptyRow(body, withActions ? 7 : 6, '号池中还没有账号。在“账号管理”中添加第一个账号。'); return; }
     for (const account of list) {
       const row = element('tr');
-      row.append(identityCell(account), stateCell(account), budgetCell(account), element('td', 'mono', `${number(account.in_flight)} / ${number(account.max_concurrent)}`), successCell(account));
+      row.append(identityCell(account), healthCell(account), stateCell(account), budgetCell(account), element('td', 'mono', `${number(account.in_flight)} / ${number(account.max_concurrent)}`), successCell(account));
       if (withActions) {
         const cell = element('td');
         const actions = element('div', 'account-actions');

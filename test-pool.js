@@ -58,6 +58,8 @@ async function main() {
   (await limited.acquire()).release();
   (await limited.acquire()).release();
   assert.strictEqual(limited.snapshot().accounts[0].status, 'rate_limited');
+  assert.strictEqual(limited.snapshot().accounts[0].health_status, 'healthy', '本地额度耗尽不代表上游账号异常');
+  assert.strictEqual(limited.snapshot().accounts[0].schedulable, false);
   let qpsAssigned = false;
   const qpsPromise = limited.acquire().then((lease) => { qpsAssigned = true; return lease; });
   now += 999;
@@ -117,6 +119,9 @@ async function main() {
   (await auth.acquire()).release({ kind: 'auth', status: 401, message: 'secret-do-not-leak' });
   assert.strictEqual(auth.snapshot().accounts[0].status, 'invalid');
   assert.strictEqual(auth.snapshot().accounts[0].invalid_reason, 'authentication_failed');
+  assert.strictEqual(auth.snapshot().accounts[0].health_status, 'unhealthy');
+  assert.strictEqual(auth.snapshot().accounts[0].health_reason, 'authentication_failed');
+  assert.strictEqual(auth.snapshot().accounts[0].schedulable, false);
   assert.ok(!JSON.stringify(auth.snapshot()).includes('secret'));
   await assert.rejects(auth.acquire(), (error) => error.status === 503);
   auth.setAccounts([account('auth', { token: 'replacement' })]);
@@ -130,7 +135,13 @@ async function main() {
   const cooldown = makePool([cooldownConfig], { now: () => now });
   (await cooldown.acquire()).release({ kind: 'rate_limit', status: 429 });
   assert.strictEqual(cooldown.snapshot().accounts[0].cooldown_until, new Date(102000).toISOString());
+  assert.strictEqual(cooldown.snapshot().accounts[0].health_status, 'unhealthy');
+  assert.strictEqual(cooldown.snapshot().accounts[0].health_reason, 'rate_limited');
+  assert.strictEqual(cooldown.snapshot().accounts[0].schedulable, false);
   now = 102000;
+  assert.strictEqual(cooldown.snapshot().accounts[0].health_status, 'unknown');
+  assert.strictEqual(cooldown.snapshot().accounts[0].health_reason, 'awaiting_retry');
+  assert.strictEqual(cooldown.snapshot().accounts[0].schedulable, true);
   (await cooldown.acquire()).release({ kind: 'rate_limit', status: 429 });
   assert.strictEqual(cooldown.snapshot().accounts[0].cooldown_until, new Date(106000).toISOString());
   now = 106000;
@@ -153,6 +164,8 @@ async function main() {
   now += 100;
   await assert.rejects(expired.acquire(), (error) => error.status === 503);
   assert.strictEqual(expired.snapshot().accounts[0].invalid_reason, 'token_expired');
+  assert.strictEqual(expired.snapshot().accounts[0].health_status, 'unhealthy');
+  assert.strictEqual(expired.snapshot().accounts[0].health_reason, 'token_expired');
   expired.setAccounts([account('expired', { token_expires_at: null })]);
   (await expired.acquire()).release({ status: 499 });
   assert.strictEqual(expired.snapshot().accounts[0].stats.cancelled, 1);
@@ -168,6 +181,8 @@ async function main() {
   const waiting = updating.acquire();
   oldOne.release({ kind: 'auth', status: 401 });
   assert.strictEqual(updating.snapshot().accounts[0].status, 'busy');
+  assert.strictEqual(updating.snapshot().accounts[0].health_status, 'unknown', '旧凭证失败不能污染新凭证健康');
+  assert.strictEqual(updating.snapshot().accounts[0].last_checked_at, null);
   oldTwo.release({ kind: 'auth', status: 401 });
   const fresh = await waiting;
   assert.strictEqual(fresh.client.token, 'new-token');
@@ -181,8 +196,86 @@ async function main() {
   const disabled = makePool([{ id: 'empty' }, account('disabled', { enabled: false }), account('excluded')]);
   await assert.rejects(disabled.acquire({ exclude: ['excluded'] }), (error) => error.status === 503);
   assert.strictEqual(disabled.snapshot().summary.invalid, 1);
+  assert.strictEqual(disabled.snapshot().accounts[0].health_reason, 'missing_token');
+  assert.strictEqual(disabled.snapshot().accounts[0].schedulable, false);
+  assert.strictEqual(disabled.snapshot().accounts[1].health_status, 'unknown');
+  assert.strictEqual(disabled.snapshot().accounts[1].schedulable, false);
   disabled.close();
   console.log('[PASS] 空凭证、禁用和重试排除列表');
+
+  let healthNow = 1000000;
+  const healthConfig = account('health');
+  const health = makePool([healthConfig], { now: () => healthNow });
+  let healthView = health.snapshot().accounts[0];
+  assert.deepStrictEqual([healthView.health_status, healthView.health_reason, healthView.last_checked_at, healthView.schedulable],
+    ['unknown', null, null, true]);
+  let healthLease = await health.acquire();
+  assert.strictEqual(health.snapshot().accounts[0].status, 'busy');
+  assert.strictEqual(health.snapshot().accounts[0].health_status, 'unknown');
+  assert.strictEqual(health.snapshot().accounts[0].schedulable, false);
+  healthLease.release({ status: 499 });
+  assert.strictEqual(health.snapshot().accounts[0].last_checked_at, null);
+  (await health.acquire()).release();
+  healthView = health.snapshot().accounts[0];
+  assert.deepStrictEqual([healthView.health_status, healthView.health_reason, healthView.last_checked_at, healthView.schedulable],
+    ['healthy', null, new Date(healthNow).toISOString(), true]);
+  health.setAccounts([{ ...healthConfig, enabled: false }]);
+  assert.strictEqual(health.snapshot().accounts[0].health_status, 'healthy');
+  assert.strictEqual(health.snapshot().accounts[0].schedulable, false);
+  health.setAccounts([healthConfig]);
+  healthNow += 10;
+  (await health.acquire()).release({ kind: 'upstream', status: 502 });
+  healthView = health.snapshot().accounts[0];
+  const failedCheckedAt = new Date(healthNow).toISOString();
+  assert.deepStrictEqual([healthView.health_status, healthView.health_reason, healthView.last_checked_at, healthView.schedulable],
+    ['unhealthy', 'upstream_error', failedCheckedAt, false]);
+  let healthAssigned = false;
+  const healthWaiting = health.acquire().then((lease) => { healthAssigned = true; return lease; });
+  await turn();
+  assert.strictEqual(healthAssigned, false, '健康异常时不能分配新请求');
+  healthNow += 2000;
+  health.setAccounts([healthConfig]);
+  healthLease = await healthWaiting;
+  assert.strictEqual(health.snapshot().accounts[0].health_status, 'unknown');
+  assert.strictEqual(health.snapshot().accounts[0].health_reason, 'awaiting_retry');
+  healthLease.release({ name: 'AbortError' });
+  assert.strictEqual(health.snapshot().accounts[0].last_checked_at, failedCheckedAt, '取消不能覆盖最近的实际检测结果');
+  healthNow++;
+  (await health.acquire()).release();
+  assert.strictEqual(health.snapshot().accounts[0].health_status, 'healthy');
+  assert.strictEqual(health.snapshot().accounts[0].health_reason, null);
+  health.close();
+  console.log('[PASS] 真实请求驱动健康、繁忙/禁用保持健康、异常隔离与冷却重试、取消不污染');
+
+  const bypass = makePool([account('bad-health'), account('good-health')]);
+  (await bypass.acquire()).release({ kind: 'rate_limit', status: 429 });
+  (await bypass.acquire()).release();
+  const healthySelected = await bypass.acquire();
+  assert.strictEqual(healthySelected.accountId, 'good-health', '轮询不能分配 health_status=unhealthy 的账号');
+  healthySelected.release();
+  bypass.close();
+  for (const [kind, reason] of [['auth', 'authentication_failed'], ['mute', 'account_muted'], ['captcha', 'verification_required']]) {
+    const blockedConfig = account(`blocked-${kind}`, { max_concurrent: 2 });
+    const blockedHealth = makePool([blockedConfig], { now: () => healthNow });
+    const oldSuccess = await blockedHealth.acquire();
+    (await blockedHealth.acquire()).release({ kind, status: kind === 'auth' ? 401 : 403 });
+    oldSuccess.release();
+    assert.strictEqual(blockedHealth.snapshot().accounts[0].health_status, 'unhealthy', '并行成功不能清除持久身份异常');
+    blockedHealth.setAccounts([{ ...blockedConfig, enabled: false, name: 'renamed' }]);
+    assert.strictEqual(blockedHealth.snapshot().accounts[0].health_reason, reason);
+    blockedHealth.setAccounts([blockedConfig]);
+    await assert.rejects(blockedHealth.acquire(), (error) => error.status === 503);
+    blockedHealth.setAccounts([{ ...blockedConfig, token: 'replacement-credential' }]);
+    assert.strictEqual(blockedHealth.snapshot().accounts[0].health_status, 'unknown');
+    assert.strictEqual(blockedHealth.snapshot().accounts[0].last_checked_at, null);
+    const oldPending = await blockedHealth.acquire();
+    blockedHealth.setAccounts([{ ...blockedConfig, token: 'replacement-again' }]);
+    oldPending.release();
+    assert.strictEqual(blockedHealth.snapshot().accounts[0].health_status, 'unknown', '旧凭证成功不能把新凭证标健康');
+    assert.strictEqual(blockedHealth.snapshot().accounts[0].last_checked_at, null);
+    blockedHealth.close();
+  }
+  console.log('[PASS] 调度跳过异常账号、持久身份异常不能靠改名启停清除、新旧凭证结果隔离');
 
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ds2api-pool-test-'));
   const stateFile = path.join(temporaryRoot, 'pool-state.json');
@@ -197,7 +290,12 @@ async function main() {
     persistent.close();
     persistent = makePool(persistentConfigs, { stateFile, now: () => now });
     assert.strictEqual(persistent.snapshot().accounts[0].invalid_reason, 'authentication_failed');
+    assert.strictEqual(persistent.snapshot().accounts[0].health_status, 'unhealthy');
+    assert.strictEqual(persistent.snapshot().accounts[0].last_checked_at, null);
     assert.strictEqual(persistent.snapshot().accounts[1].status, 'cooldown');
+    assert.strictEqual(persistent.snapshot().accounts[1].health_status, 'unhealthy');
+    assert.strictEqual(persistent.snapshot().accounts[1].health_reason, 'rate_limited');
+    assert.strictEqual(persistent.snapshot().accounts[1].schedulable, false);
     assert.strictEqual(persistent.snapshot().accounts[1].cooldown_until, new Date(102000).toISOString());
     now = 102000;
     (await persistent.acquire()).release({ kind: 'rate_limit', status: 429 });
@@ -206,6 +304,7 @@ async function main() {
     const changed = [account('invalid', { token: 'new-credential' }), persistentConfigs[1]];
     persistent = makePool(changed, { stateFile, now: () => now });
     assert.strictEqual(persistent.snapshot().accounts[0].status, 'available', '新 token 不能继承旧凭证的失效状态');
+    assert.strictEqual(persistent.snapshot().accounts[0].health_status, 'unknown');
     (await persistent.acquire()).release({ kind: 'auth', status: 401 });
     persistent.close();
     persistent = makePool([{ ...changed[0], token_expires_at: new Date(now + 100000).toISOString() }, changed[1]],
@@ -216,9 +315,15 @@ async function main() {
     const coolingOnly = [persistentConfigs[1]];
     now = 106000;
     persistent = makePool(coolingOnly, { stateFile, now: () => now });
+    assert.strictEqual(persistent.snapshot().accounts[0].health_status, 'unknown');
+    assert.strictEqual(persistent.snapshot().accounts[0].health_reason, 'awaiting_retry');
     (await persistent.acquire()).release();
+    assert.strictEqual(persistent.snapshot().accounts[0].health_status, 'healthy');
     persistent.close();
     persistent = makePool(coolingOnly, { stateFile, now: () => now });
+    assert.strictEqual(persistent.snapshot().accounts[0].health_status, 'unknown', '重启后需新的成功请求才能确认健康');
+    assert.strictEqual(persistent.snapshot().accounts[0].health_reason, null);
+    assert.strictEqual(persistent.snapshot().accounts[0].last_checked_at, null);
     (await persistent.acquire()).release({ kind: 'rate_limit', status: 429 });
     assert.strictEqual(persistent.snapshot().accounts[0].cooldown_until, new Date(108000).toISOString());
     persistent.close();

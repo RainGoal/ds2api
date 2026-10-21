@@ -207,6 +207,21 @@ const stats = () => admin('/stats');
 const patch = (id, changes) => admin(`/accounts/${encodeURIComponent(id)}`, 'PATCH', changes);
 const remove = (id) => admin(`/accounts/${encodeURIComponent(id)}`, 'DELETE');
 
+function healthView(account) {
+  const { health_status, health_reason, last_checked_at, schedulable } = account;
+  return { health_status, health_reason, last_checked_at, schedulable };
+}
+
+async function assertHealthAPIsConsistent(snapshot) {
+  const pool = snapshot || (await status()).pool;
+  const listed = (await admin('/accounts')).data;
+  assert.deepStrictEqual(listed.map((account) => account.id), pool.accounts.map((account) => account.id));
+  for (const account of pool.accounts) {
+    assert.deepStrictEqual(healthView(listed.find((item) => item.id === account.id)), healthView(account),
+      '账号列表与号池状态的健康字段应保持一致');
+  }
+}
+
 async function createAccount(id, extra = {}) {
   const token = `${id}-secret`;
   secrets.push(token);
@@ -255,6 +270,14 @@ async function main() {
   assert.ok((await page.text()).includes('<html'), '应提供网页管理台');
   console.log('[PASS] 管理台可访问、管理密钥与调用密钥隔离');
 
+  const initialPool = (await status()).pool;
+  for (const account of initialPool.accounts) {
+    assert.deepStrictEqual(healthView(account), {
+      health_status: 'unknown', health_reason: null, last_checked_at: null, schedulable: true,
+    }, '未发起真实请求的账号应为未知健康状态，并允许首次尝试');
+  }
+  await assertHealthAPIsConsistent(initialPool);
+
   const first = await chat('DO_NOT_LOG_PROMPT');
   assert.strictEqual(first.status, 200);
   assert.strictEqual(first.body.choices[0].message.content, 'mock-success');
@@ -266,10 +289,43 @@ async function main() {
   const firstPool = (await status()).pool;
   assert.strictEqual(firstPool.accounts.find((account) => account.id === 'bad').status, 'invalid');
   assert.strictEqual(firstPool.accounts.find((account) => account.id === 'limited').status, 'cooldown');
+  for (const [id, expectedHealth, expectedReason, expectedSchedulable] of [
+    ['bad', 'unhealthy', 'authentication_failed', false],
+    ['limited', 'unhealthy', 'rate_limited', false],
+    ['ok', 'healthy', null, true],
+  ]) {
+    const account = firstPool.accounts.find((item) => item.id === id);
+    assert.strictEqual(account.health_status, expectedHealth);
+    assert.strictEqual(account.health_reason, expectedReason);
+    assert.strictEqual(account.schedulable, expectedSchedulable);
+    assert.strictEqual(new Date(account.last_checked_at).toISOString(), account.last_checked_at);
+  }
+  await assertHealthAPIsConsistent(firstPool);
   const firstPublic = JSON.stringify({ pool: firstPool, logs: await admin('/logs') });
   for (const secret of secrets) assert.ok(!firstPublic.includes(secret), '管理接口不能泄露凭证');
   assert.ok(!firstPublic.includes('DO_NOT_LOG_PROMPT'), '日志不能包含提示词');
   console.log('[PASS] 401 停用、429 冷却、首输出前换号、请求与尝试分开计数');
+
+  const badHealth = healthView(firstPool.accounts.find((account) => account.id === 'bad'));
+  await patch('bad', { enabled: false });
+  await patch('bad', { enabled: true });
+  assert.deepStrictEqual(healthView((await status()).pool.accounts.find((account) => account.id === 'bad')), badHealth,
+    '停用再启用不能清除真实请求发现的鉴权异常');
+  const failedCredentialAttempts = seen.filter((entry) => entry.url === '/api/v0/chat_session/create' && entry.token === 'bad-secret').length;
+  assert.strictEqual((await chat('skip-invalid-account')).status, 200);
+  assert.strictEqual(seen.filter((entry) => entry.url === '/api/v0/chat_session/create' && entry.token === 'bad-secret').length,
+    failedCredentialAttempts, '后续请求不得重新分配给已鉴权失败的账号');
+  assert.ok(seen.some((entry) => entry.prompt === 'skip-invalid-account' && entry.token === 'ok-secret'));
+  for (const body of [
+    { health_status: 'healthy' }, { health_reason: null },
+    { last_checked_at: new Date().toISOString() }, { schedulable: true },
+  ]) {
+    const response = await call('/admin/api/accounts/bad', { method: 'PATCH', body });
+    assert.strictEqual(response.status, 400, '健康状态必须来自真实请求，不能由客户端伪造');
+    await response.arrayBuffer();
+  }
+  assert.deepStrictEqual(healthView((await status()).pool.accounts.find((account) => account.id === 'bad')), badHealth);
+  console.log('[PASS] 健康字段 API 一致、失败账号隔离、启停和客户端 PATCH 不能伪造健康');
 
   await createAccount('extra');
   await patch('extra', { enabled: false, name: '临时账号', qps: 2, rpm: 3 });
@@ -277,7 +333,10 @@ async function main() {
   assert.strictEqual(extra.status, 'disabled');
   assert.strictEqual(extra.qps, 2);
   assert.strictEqual(extra.rpm, 3);
-  await patch('bad', { token: 'recovered-secret', enabled: true });
+  const recovered = (await patch('bad', { token: 'recovered-secret', enabled: true })).account;
+  assert.deepStrictEqual(healthView(recovered), {
+    health_status: 'unknown', health_reason: null, last_checked_at: null, schedulable: true,
+  }, '更新 Token 后应等待新凭证的真实请求结果');
   secrets.push('recovered-secret');
   assert.strictEqual((await status()).pool.accounts.find((account) => account.id === 'bad').status, 'available');
   await remove('limited');
@@ -286,6 +345,7 @@ async function main() {
   const hot = await chat('hot-token-check');
   assert.strictEqual(hot.status, 200);
   assert.ok(seen.some((entry) => entry.prompt === 'hot-token-check' && entry.token === 'recovered-secret'));
+  assert.strictEqual((await status()).pool.accounts.find((account) => account.id === 'bad').health_status, 'healthy');
   const invalidLimit = await call('/admin/api/accounts/bad', { method: 'PATCH', body: { qps: 0 } });
   assert.strictEqual(invalidLimit.status, 400);
   assert.strictEqual((await status()).pool.accounts.find((account) => account.id === 'bad').qps, 100);
@@ -340,6 +400,7 @@ async function main() {
 
   await createAccount('cancel');
   await isolate('cancel');
+  const beforeCancelHealth = healthView((await status()).pool.accounts.find((account) => account.id === 'cancel'));
   const abort = new AbortController();
   const cancellable = await call('/v1/chat/completions', {
     key: CLIENT_KEY, method: 'POST', signal: abort.signal,
@@ -353,7 +414,11 @@ async function main() {
     const snapshot = await status();
     return snapshot.pool.accounts.find((account) => account.id === 'cancel').in_flight === 0 && snapshot.statistics.requests.cancelled >= 1;
   }, '客户端取消后没有释放账号或记录取消');
+  assert.deepStrictEqual(healthView((await status()).pool.accounts.find((account) => account.id === 'cancel')), beforeCancelHealth,
+    '客户端取消不能将未知账号判为健康或异常，也不能更新检测时间');
+  await assertHealthAPIsConsistent();
   assert.strictEqual((await chat('after-cancel')).status, 200);
+  assert.strictEqual((await status()).pool.accounts.find((account) => account.id === 'cancel').health_status, 'healthy');
   console.log('[PASS] 客户端取消释放账号并单独计数，后续请求可继续使用');
 
   await createAccount('serial');
@@ -388,6 +453,9 @@ async function main() {
   assert.ok(Date.now() - rpmWait >= 1100, '等待 RPM 窗口应受排队超时控制');
   assert.ok(rpmBlocked.body.error);
   assert.ok(!seen.some((entry) => entry.prompt === 'rpm-blocked'), '被本地 RPM 限制的请求不能触达上游');
+  const rpmHealth = (await status()).pool.accounts.find((account) => account.id === 'rpm');
+  assert.strictEqual(rpmHealth.health_status, 'healthy', '本地配额耗尽不代表账号健康异常');
+  assert.strictEqual(rpmHealth.schedulable, false);
   console.log('[PASS] 单账号 RPM 限制、等待超时与上游请求隔离');
 
   const allLogs = await admin('/logs?limit=200');
@@ -413,6 +481,10 @@ async function main() {
   assert.strictEqual(restarted.statistics.attempts.total, beforeRestart.attempts.total);
   assert.ok(restarted.pool.accounts.some((account) => account.id === 'rpm' && account.rpm === 1));
   assert.ok(!restarted.pool.accounts.some((account) => account.id === 'limited'));
+  assert.deepStrictEqual(healthView(restarted.pool.accounts.find((account) => account.id === 'rpm')), {
+    health_status: 'unknown', health_reason: null, last_checked_at: null, schedulable: true,
+  }, '重启后健康判断应等待当前进程的真实请求，配置与累计统计继续保留');
+  await assertHealthAPIsConsistent(restarted.pool);
   console.log('[PASS] 日志脱敏分页、实际 JSONL 格式、账号与统计重启持久化');
   console.log('账号池全链路测试全部通过 ✔');
 }

@@ -53,8 +53,8 @@
 
         <div class="overview-grid">
           <article class="panel pool-panel">
-            <div class="panel-heading"><div><div class="eyebrow">POOL HEALTH</div><h2>账号状态分布</h2></div><span class="live-tag"><span class="signal-dot"></span>5 秒更新</span></div>
-            <div class="pool-strip" id="pool-strip" aria-label="账号状态分布"></div>
+            <div class="panel-heading"><div><div class="eyebrow">POOL SCHEDULING</div><h2>调度状态分布</h2></div><span class="live-tag"><span class="signal-dot"></span>5 秒更新</span></div>
+            <div class="pool-strip" id="pool-strip" aria-label="调度状态分布"></div>
             <div class="distribution-grid" id="pool-distribution"></div>
             <div class="queue-line"><span>排队中的请求</span><strong class="mono" id="queue-count">—</strong><span class="queue-caption">按可用账号与频率预算分配</span></div>
           </article>
@@ -68,15 +68,15 @@
 
         <article class="panel">
           <div class="panel-heading"><div><div class="eyebrow">ACCOUNT ACTIVITY</div><h2>账号运行状态</h2></div><button class="text-button" data-go-tab="accounts" type="button">管理全部账号 <span aria-hidden="true">↗</span></button></div>
-          <div class="table-scroll"><table><thead><tr><th>账号</th><th>状态</th><th>频率预算</th><th>并发</th><th>尝试成功率</th></tr></thead><tbody id="overview-accounts-body"><tr><td colspan="5" class="empty-cell">连接管理密钥后查看账号。</td></tr></tbody></table></div>
+          <div class="table-scroll"><table class="overview-accounts-table"><thead><tr><th>账号</th><th>账号健康</th><th>调度状态</th><th>频率预算</th><th>并发</th><th>尝试成功率</th></tr></thead><tbody id="overview-accounts-body"><tr><td colspan="6" class="empty-cell">连接管理密钥后查看账号。</td></tr></tbody></table></div>
         </article>
       </section>
 
       <section class="page" id="page-accounts" aria-labelledby="accounts-title" hidden>
         <div class="page-heading"><div><div class="eyebrow">OPERATIONS / ACCOUNTS</div><h1 id="accounts-title">账号管理<span class="heading-dot">.</span></h1><p class="page-description">维护账号凭证，分别设置调用频率、并发与冷却时间。</p></div><button class="button button-primary" id="add-account-button" type="button"><span aria-hidden="true">＋</span> 添加账号</button></div>
         <div class="account-toolbar"><span id="accounts-count">共 — 个账号</span><button class="text-button refresh-status" type="button">刷新列表 <span aria-hidden="true">↻</span></button></div>
-        <article class="panel account-table-panel"><div class="table-scroll"><table class="accounts-table"><thead><tr><th>账号 / 标识</th><th>状态</th><th>QPS / RPM</th><th>并发</th><th>尝试成功率</th><th>操作</th></tr></thead><tbody id="accounts-body"><tr><td colspan="6" class="empty-cell">尚未加载账号。</td></tr></tbody></table></div></article>
-        <div class="inline-notes"><span><i class="legend-dot status-cooldown"></i>限流账号冷却后自动重新参与调度。</span><span><i class="legend-dot status-invalid"></i>凭证失效或需验证的账号，请更新 Token 后恢复。</span></div>
+        <article class="panel account-table-panel"><div class="table-scroll"><table class="accounts-table"><thead><tr><th>账号 / 标识</th><th>账号健康</th><th>调度状态</th><th>QPS / RPM</th><th>并发</th><th>尝试成功率</th><th>操作</th></tr></thead><tbody id="accounts-body"><tr><td colspan="7" class="empty-cell">尚未加载账号。</td></tr></tbody></table></div></article>
+        <div class="inline-notes"><span><i class="legend-dot status-cooldown"></i>限流账号冷却后自动重新参与调度。</span><span><i class="legend-dot status-invalid"></i>凭证失效或需验证的账号，请更新 Token 后恢复。</span><span><i class="legend-dot health-unknown"></i>健康状态按请求结果自动更新，待验证账号可在满足调度条件时参与请求。</span></div>
       </section>
 
       <section class="page" id="page-logs" aria-labelledby="logs-title" hidden>
