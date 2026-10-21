@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!.dockerignore
+!server.js
+!config.example.json
+!lib/
+!lib/**
+!public/
+!public/**
+!docker/
+!docker/entrypoint.js

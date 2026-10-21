@@ -2,6 +2,7 @@
   "host": "127.0.0.1",
   "port": 3210,
   "api_key": "",
+  "admin_key": "",
   "token": "",
   "base_url": "https://chat.deepseek.com",
   "x_client_version": "2.5.0",
@@ -12,5 +13,19 @@
   "user_agent": "",
   "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
   "risk_headers": true,
-  "idle_timeout_ms": 120000
+  "idle_timeout_ms": 120000,
+  "pool_settings": {
+    "qps": 1,
+    "rpm": 20,
+    "max_concurrent": 1,
+    "cooldown_seconds": 60,
+    "max_cooldown_seconds": 900,
+    "queue_timeout_ms": 30000,
+    "max_pending": 100,
+    "max_attempts": 3
+  },
+  "logging": {
+    "max_log_bytes": 10485760,
+    "retention_files": 5
+  }
 }

@@ -13,11 +13,16 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { DeepSeekClient, UpstreamError } = require('./lib/dsweb');
+const { UpstreamError } = require('./lib/dsweb');
+const { AccountPool, PoolError } = require('./lib/pool');
+const { ConfigStore } = require('./lib/config');
+const { Telemetry } = require('./lib/telemetry');
+const { serveAdminPage, createAdminHandler } = require('./lib/admin');
 const { parseToolCalls, holdIndex, renderToolsSection, renderCallsBlock } = require('./lib/tools');
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
-const PID_PATH = path.join(__dirname, 'server.pid');
+const CONFIG_PATH = path.resolve(process.env.DS_CONFIG_PATH || path.join(__dirname, 'config.json'));
+const PID_PATH = process.env.DS_PID_PATH || path.join(path.dirname(CONFIG_PATH), 'server.pid');
+const configStore = new ConfigStore(CONFIG_PATH);
 
 // ---------- 配置 ----------
 
@@ -28,7 +33,7 @@ function loadConfig() {
       fs.copyFileSync(path.join(__dirname, 'config.example.json'), CONFIG_PATH);
       console.log('[提示] 已从 config.example.json 生成 config.json');
     }
-    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+    cfg = configStore.read();
   } catch (e) {
     console.error(`[错误] 无法读取 config.json: ${e.message}`);
     process.exit(1);
@@ -37,6 +42,7 @@ function loadConfig() {
     host: process.env.DS_HOST || cfg.host || '127.0.0.1',
     port: Number(process.env.DS_PORT || cfg.port || 3210),
     apiKey: process.env.DS_API_KEY || cfg.api_key || '',
+    adminKey: process.env.DS_ADMIN_KEY || cfg.admin_key || '',
     token: process.env.DS_TOKEN || cfg.token || '',
     baseUrl: process.env.DS_BASE_URL || cfg.base_url || 'https://chat.deepseek.com',
     xClientVersion: cfg.x_client_version || '2.5.0',
@@ -48,12 +54,16 @@ function loadConfig() {
     userAgent: cfg.user_agent || undefined,
     acceptLanguage: cfg.accept_language || undefined,
     riskHeaders: cfg.risk_headers ?? true,
+    accounts: configStore.accounts(cfg),
+    poolSettings: cfg.pool_settings || {},
+    logging: cfg.logging || {},
+    dataDirectory: path.resolve(path.dirname(CONFIG_PATH), process.env.DS_DATA_DIR || cfg.data_dir || 'data'),
   };
 }
 
 const cfg = loadConfig();
 
-const client = new DeepSeekClient({
+const clientOptions = {
   baseUrl: cfg.baseUrl,
   token: cfg.token,
   deviceId: cfg.deviceId,
@@ -63,6 +73,23 @@ const client = new DeepSeekClient({
   userAgent: cfg.userAgent,
   acceptLanguage: cfg.acceptLanguage,
   riskHeaders: cfg.riskHeaders,
+};
+const pool = new AccountPool({
+  accounts: cfg.accounts,
+  defaults: cfg.poolSettings,
+  clientOptions,
+  queueTimeoutMs: cfg.poolSettings.queue_timeout_ms ?? 30000,
+  maxPending: cfg.poolSettings.max_pending ?? 100,
+  stateFile: path.join(cfg.dataDirectory, 'pool-state.json'),
+});
+const maxAttempts = cfg.poolSettings.max_attempts ?? 3;
+if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 20) {
+  throw new Error('pool_settings.max_attempts 必须是 1–20 的整数');
+}
+const telemetry = new Telemetry({
+  directory: cfg.dataDirectory,
+  maxLogBytes: cfg.logging.max_log_bytes ?? 10485760,
+  retentionFiles: cfg.logging.retention_files ?? 5,
 });
 
 // ---------- 模型与能力开关 ----------
@@ -105,22 +132,6 @@ function resolveFlags(body) {
   if (search === null) search = cfg.defaultSearch;
 
   return { thinking, search };
-}
-
-// 打印请求里非标准字段，便于观察 ZCode 等客户端实际发送的开关字段
-const STANDARD_KEYS = new Set([
-  'model', 'messages', 'stream', 'stream_options', 'temperature', 'top_p', 'max_tokens',
-  'max_completion_tokens', 'stop', 'tools', 'tool_choice', 'user', 'n', 'presence_penalty',
-  'frequency_penalty', 'logit_bias', 'response_format', 'seed',
-]);
-function extraFieldsOf(body) {
-  const extras = {};
-  for (const k of Object.keys(body)) {
-    if (!STANDARD_KEYS.has(k)) extras[k] = body[k];
-  }
-  return Object.keys(extras).length
-    ? ` extra=${JSON.stringify(extras).slice(0, 200)}`
-    : '';
 }
 
 // ---------- messages → 单段 prompt ----------
@@ -194,6 +205,7 @@ class HttpError extends Error {
 }
 
 function sendJson(res, status, obj) {
+  if (res.destroyed) return;
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -203,6 +215,8 @@ function sendJson(res, status, obj) {
 }
 
 function sendError(res, err) {
+  if (res.destroyed || res.writableEnded) return;
+  if (err.retryAfterMs > 0) res.setHeader('retry-after', String(Math.max(1, Math.ceil(err.retryAfterMs / 1000))));
   const status = err.status || 500;
   sendJson(res, status, {
     error: {
@@ -247,6 +261,82 @@ function checkLocalAuth(req) {
   }
 }
 
+function checkAdminAuth(req) {
+  if (!cfg.adminKey) throw new HttpError(503, '管理接口未启用：请设置 admin_key 或 DS_ADMIN_KEY 后重启');
+  const expected = Buffer.from('Bearer ' + cfg.adminKey);
+  const actual = Buffer.from(req.headers.authorization || '');
+  if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
+    throw new HttpError(401, '管理密钥不正确', 'authentication_error');
+  }
+}
+
+function cancelledError() {
+  return new HttpError(499, '请求已取消', 'request_cancelled');
+}
+
+function errorKind(error) {
+  if (error.status === 499 || error.name === 'AbortError') return 'cancelled';
+  if (error.code === 'pool_queue_full') return 'queue_full';
+  if (error.code === 'pool_timeout') return 'queue_timeout';
+  if (error instanceof PoolError) return 'pool_exhausted';
+  return error.kind || (error.status === 400 ? 'invalid_request' : error.type || 'upstream');
+}
+
+function publicErrorMessage(error) {
+  if (!(error instanceof UpstreamError)) return error.message || '上游错误';
+  return {
+    auth: 'DeepSeek 凭证失效，请更新账号 Token',
+    rate_limit: 'DeepSeek 暂时限流，账号已进入冷却',
+    mute: 'DeepSeek 账号受限，请人工处理',
+    captcha: 'DeepSeek 账号需要人工验证',
+  }[error.kind] || 'DeepSeek 上游连接或协议异常';
+}
+
+// 仅在当前尝试尚未产生正文或思考内容时，切换到另一可用账号。
+async function* pooledChat(options, context) {
+  const excluded = [];
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let lease;
+    try {
+      lease = await pool.acquire({ signal: options.signal, exclude: excluded });
+    } catch (error) {
+      if (options.signal.aborted) throw cancelledError();
+      throw lastError || error;
+    }
+    context.accountId = lease.accountId;
+    context.attempts++;
+    excluded.push(lease.accountId);
+    const started = Date.now();
+    let outputStarted = false;
+    let failure = null;
+    let completed = false;
+    try {
+      for await (const event of lease.client.chat(options)) {
+        if (options.signal.aborted) throw cancelledError();
+        if (event.kind === 'delta' && event.text) outputStarted = true;
+        if (event.kind !== 'meta') yield event;
+      }
+      if (options.signal.aborted) throw cancelledError();
+      completed = true;
+    } catch (error) {
+      failure = options.signal.aborted ? cancelledError() : error;
+    } finally {
+      if (!completed && !failure) failure = cancelledError();
+      lease.release(failure);
+      telemetry.recordAttempt({
+        account_id: lease.accountId,
+        outcome: completed ? 'success' : failure.status === 499 ? 'cancelled' : 'failed',
+        duration_ms: Date.now() - started, error_kind: failure ? errorKind(failure) : null,
+      });
+    }
+    if (completed) return;
+    lastError = failure;
+    if (outputStarted || failure.status === 499 || attempt + 1 === maxAttempts) throw failure;
+  }
+  throw lastError;
+}
+
 const log = (msg) => console.log(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${msg}`);
 
 // ---------- 路由 ----------
@@ -264,10 +354,45 @@ async function handleModels(req, res) {
 }
 
 async function handleChatCompletions(req, res) {
+  const started = Date.now();
+  const context = {
+    id: 'chatcmpl-' + crypto.randomUUID().replace(/-/g, ''),
+    controller: new AbortController(), accountId: null, attempts: 0,
+    model: MODEL_ID, stream: false, failure: null,
+  };
+  const onClose = () => { if (!res.writableEnded) context.controller.abort(); };
+  req.once('aborted', onClose);
+  res.once('close', onClose);
+  res.setHeader('x-request-id', context.id);
+  try {
+    checkLocalAuth(req);
+    await runChatCompletions(req, res, context);
+  } catch (error) {
+    context.failure = error;
+    throw error;
+  } finally {
+    req.removeListener('aborted', onClose);
+    res.removeListener('close', onClose);
+    const failure = context.controller.signal.aborted ? cancelledError() : context.failure;
+    telemetry.recordRequest({
+      request_id: context.id, model: context.model, stream: context.stream,
+      started_at: new Date(started).toISOString(), duration_ms: Date.now() - started,
+      account_id: context.accountId, attempts: context.attempts,
+      outcome: !failure ? 'success' : failure.status === 499 ? 'cancelled' : 'failed',
+      http_status: res.headersSent ? res.statusCode : failure?.status || 200,
+      error_kind: failure ? errorKind(failure) : null,
+    });
+  }
+}
+
+async function runChatCompletions(req, res, context) {
   const body = await readBody(req);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, '请求体必须是 JSON 对象');
   if (!Array.isArray(body.messages)) throw new HttpError(400, '缺少 messages 数组');
   const model = body.model || MODEL_ID;
   const stream = !!body.stream;
+  context.model = model;
+  context.stream = stream;
   const { thinking, search } = resolveFlags(body);
 
   // 工具调用：把 tools 渲染进提示词；tool_choice=none 则不注入也不识别调用标记
@@ -277,25 +402,14 @@ async function handleChatCompletions(req, res) {
   const toolsSection = toolsArr.length && !noTools ? renderToolsSection(toolsArr, toolChoice) : null;
   const prompt = buildPrompt(body.messages, toolsSection);
 
-  if (!cfg.token) {
-    throw new HttpError(
-      401,
-      '尚未配置 DeepSeek token：请运行 node login.js <邮箱> <密码>，或把网页端 token 填入 config.json',
-      'authentication_error'
-    );
-  }
-
-  const id = `chatcmpl-${crypto.randomUUID().replace(/-/g, '')}`;
+  const id = context.id;
   const created = Math.floor(Date.now() / 1000);
-  const controller = new AbortController();
-  req.on('close', () => controller.abort());
-
-  const gen = client.chat({
+  const gen = pooledChat({
     prompt,
     thinkingEnabled: thinking,
     searchEnabled: search,
-    signal: controller.signal,
-  });
+    signal: context.controller.signal,
+  }, context);
 
   const started = Date.now();
   let reasoning = '';
@@ -303,6 +417,16 @@ async function handleChatCompletions(req, res) {
   let usageUpstream = null;
 
   if (stream) {
+    // 等待首个正文/思考/完成事件后发送 SSE 头，使分配失败仍返回正确 HTTP 状态。
+    const first = await gen.next();
+    async function* events() {
+      try {
+        if (!first.done) yield first.value;
+        yield* gen;
+      } finally {
+        await gen.return();
+      }
+    }
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
@@ -323,7 +447,7 @@ async function handleChatCompletions(req, res) {
     try {
       chunk({ role: 'assistant', content: '' });
       let emitted = 0; // 已作为正文增量发出的 content 前缀长度
-      for await (const ev of gen) {
+      for await (const ev of events()) {
         if (ev.kind === 'delta') {
           if (ev.type === 'reasoning') {
             reasoning += ev.text;
@@ -371,8 +495,10 @@ async function handleChatCompletions(req, res) {
       res.write('data: [DONE]\n\n');
       res.end();
     } catch (e) {
+      context.failure = e;
+      if (res.destroyed) return;
       // 流已开始，只能以 SSE 错误帧收尾
-      const message = e.message || '上游错误';
+      const message = publicErrorMessage(e);
       res.write(`data: ${JSON.stringify({ error: { message, type: e.name || 'api_error' } })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
@@ -418,7 +544,7 @@ async function handleChatCompletions(req, res) {
   }
   log(
     `${req.method} /v1/chat/completions model=${model} stream=${stream} thinking=${thinking} search=${search} ` +
-      `tools=${toolsArr.length} ${Date.now() - started}ms len(content)=${content.length}${extraFieldsOf(body)}`
+      `tools=${toolsArr.length} ${Date.now() - started}ms len(content)=${content.length}`
   );
 }
 
@@ -432,28 +558,40 @@ function buildUsage(prompt, outputText, upstreamUsage) {
   };
 }
 
+const handleAdmin = createAdminHandler({
+  store: configStore, pool, telemetry, readBody, sendJson, HttpError,
+});
+
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost');
   try {
+    const url = new URL(req.url, 'http://localhost');
+    if (serveAdminPage(req, res, url.pathname)) return;
+    if (url.pathname === '/admin/api' || url.pathname.startsWith('/admin/api/')) {
+      checkAdminAuth(req);
+      return await handleAdmin(req, res, url);
+    }
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
       sendJson(res, 200, {
         ok: true,
         name: 'ds2api',
         upstream: cfg.baseUrl,
-        token_configured: !!cfg.token,
+        token_configured: pool.snapshot().accounts.some((account) => account.token_configured),
         models: MODEL_IDS,
       });
       return;
     }
+    if (req.method === 'POST' && url.pathname === '/v1/chat/completions') return await handleChatCompletions(req, res);
     checkLocalAuth(req);
     if (req.method === 'GET' && url.pathname === '/v1/models') return await handleModels(req, res);
-    if (req.method === 'POST' && url.pathname === '/v1/chat/completions') return await handleChatCompletions(req, res);
     throw new HttpError(404, `未知路径 ${req.method} ${url.pathname}`, 'invalid_request_error');
   } catch (e) {
     if (e instanceof UpstreamError) {
-      log(`上游错误 [${e.kind}]: ${e.message}`);
-      sendError(res, new HttpError(e.status, `DeepSeek 上游错误: ${e.message}`, `upstream_${e.kind}`, e.code));
-    } else if (e instanceof HttpError) {
+      log('上游错误 kind=' + e.kind + ' status=' + e.status);
+      const safeError = new HttpError(e.status, publicErrorMessage(e), 'upstream_' + e.kind,
+        Number.isSafeInteger(e.code) ? e.code : null);
+      safeError.retryAfterMs = e.retryAfterMs;
+      sendError(res, safeError);
+    } else if (e instanceof HttpError || e instanceof PoolError) {
       if (e.status !== 404) log(`请求被拒 [${e.status}]: ${e.message}`);
       sendError(res, e);
     } else {
@@ -472,18 +610,39 @@ server.listen(cfg.port, cfg.host, () => {
   log('='.repeat(56));
   log(`ds2api 已启动  http://${cfg.host}:${cfg.port}`);
   log(`上游: ${cfg.baseUrl}`);
-  log(`token: ${cfg.token ? '已配置' : '【未配置】请运行 node login.js <邮箱> <密码>'}`);
+  log('号池账号数: ' + pool.snapshot().summary.total);
+  log('管理台: http://' + cfg.host + ':' + cfg.port + '/admin（' + (cfg.adminKey ? '已配置独立管理密钥' : '请配置 admin_key') + '）');
   log(`示例: curl http://${cfg.host}:${cfg.port}/v1/models`);
   log('='.repeat(56));
 });
 
+// 网页管理变更立即生效；CLI 登录或手改 accounts 也无需重启。
+fs.watchFile(CONFIG_PATH, { interval: 1000, persistent: false }, () => {
+  try { pool.setAccounts(configStore.accounts()); }
+  catch { log('账号配置未加载：请检查 accounts 格式，当前账号配置继续使用'); }
+});
+
+let stopping = false;
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
+  process.on(sig, async () => {
+    if (stopping) return;
+    stopping = true;
+    fs.unwatchFile(CONFIG_PATH);
+    pool.close();
     log('收到退出信号，正在关闭…');
     try {
       fs.unlinkSync(PID_PATH);
     } catch { /* 忽略 */ }
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1500).unref();
+    const forced = setTimeout(async () => {
+      server.closeAllConnections();
+      await telemetry.close();
+      process.exit(0);
+    }, 5000);
+    forced.unref();
+    server.close(async () => {
+      clearTimeout(forced);
+      await telemetry.close();
+      process.exit(0);
+    });
   });
 }

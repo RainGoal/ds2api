@@ -6,6 +6,8 @@ const http = require('http');
 const assert = require('assert');
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 const MOCK_PORT = 3199;
 const PROXY_PORT = 3101;
@@ -119,6 +121,7 @@ async function waitForServer(url, tries = 40) {
 }
 
 async function main() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ds2api-legacy-test-'));
   await new Promise((r) => mock.listen(MOCK_PORT, '127.0.0.1', r));
   const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
     env: {
@@ -128,9 +131,14 @@ async function main() {
       DS_BASE_URL: `http://127.0.0.1:${MOCK_PORT}`,
       DS_TOKEN: 'mock-token',
       DS_API_KEY: 'test-key',
+      DS_CONFIG_PATH: path.join(directory, 'config.json'),
+      DS_DATA_DIR: path.join(directory, 'data'),
+      DS_PID_PATH: path.join(directory, 'server.pid'),
     },
     stdio: 'ignore',
+    windowsHide: true,
   });
+  const childExit = new Promise((resolve) => child.once('exit', resolve));
 
   try {
     await waitForServer(`http://127.0.0.1:${PROXY_PORT}/health`);
@@ -287,7 +295,10 @@ async function main() {
     console.log('集成测试全部通过 ✔');
   } finally {
     child.kill();
+    await childExit;
     await new Promise((r) => mock.close(r));
+    if (path.dirname(path.resolve(directory)) !== path.resolve(os.tmpdir())) throw new Error('测试目录超出临时目录');
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 }
 

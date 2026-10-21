@@ -1,0 +1,40 @@
+name: ds2api
+
+services:
+  ds2api:
+    image: ds2api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 15s
+    environment:
+      NODE_ENV: production
+      DS_HOST: 0.0.0.0
+      DS_PORT: "3210"
+      DS_CONFIG_PATH: /data/config.json
+      DS_DATA_DIR: /data/state
+      DS_PID_PATH: /tmp/ds2api.pid
+    ports:
+      - "${DS_BIND_ADDRESS:-0.0.0.0}:${DS_PORT:-3210}:3210"
+    volumes:
+      - ds2api-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3210/health', { signal: AbortSignal.timeout(3000) }).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ds2api-data:

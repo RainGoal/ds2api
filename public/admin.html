@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>ds2api · 号池管理</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2325694b'/%3E%3Cpath d='M8 8h6v6H8zm10 0h6v6h-6zM8 18h6v6H8zm10 0h6v6h-6z' fill='%23edf0e4'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/admin/admin.css">
+  <script src="/admin/admin.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/admin" aria-label="ds2api 号池管理首页">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span>ds2api<span class="brand-divider">/</span><span class="brand-caption">POOL CONSOLE</span></span>
+    </a>
+    <div class="topbar-actions">
+      <span class="connection" id="connection-status"><span class="signal-dot"></span>尚未连接</span>
+      <button class="button button-quiet" id="disconnect-button" type="button" disabled>断开连接</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="sidebar-label">工作空间</div>
+      <nav class="navigation" aria-label="主导航">
+        <button class="nav-item active" data-tab="overview" type="button" aria-current="page"><span class="nav-symbol" aria-hidden="true">◫</span>运行总览<span class="nav-index">01</span></button>
+        <button class="nav-item" data-tab="accounts" type="button"><span class="nav-symbol" aria-hidden="true">◉</span>账号管理<span class="nav-index">02</span></button>
+        <button class="nav-item" data-tab="logs" type="button"><span class="nav-symbol" aria-hidden="true">≡</span>请求日志<span class="nav-index">03</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <span class="sidebar-footnote">一个入口，统一调度。</span>
+        <span class="small-mono" id="sidebar-account-count">— ACCOUNTS</span>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <div id="notice" class="notice" role="status" hidden></div>
+      <div id="persistence-warning" class="notice warning" role="alert" hidden></div>
+      <section class="page" id="page-overview" aria-labelledby="overview-title">
+        <div class="page-heading">
+          <div><div class="eyebrow">OPERATIONS / OVERVIEW</div><h1 id="overview-title">号池运行总览<span class="heading-dot">.</span></h1><p class="page-description">查看可用账号、请求结果和调度负载。</p></div>
+          <button class="button button-secondary refresh-status" type="button"><span aria-hidden="true">↻</span> 刷新状态</button>
+        </div>
+        <div class="metric-grid">
+          <article class="metric-card"><div class="metric-label">可用账号<span class="metric-icon" aria-hidden="true">↗</span></div><div class="metric-value" id="metric-available">—<span class="metric-unit" id="metric-total"></span></div><div class="metric-description" id="metric-pool-description">连接后查看账号状态</div></article>
+          <article class="metric-card"><div class="metric-label">累计请求<span class="metric-icon" aria-hidden="true">≋</span></div><div class="metric-value" id="metric-requests">—</div><div class="metric-description">按客户端请求统计</div></article>
+          <article class="metric-card metric-accent"><div class="metric-label">请求成功率<span class="metric-icon" aria-hidden="true">✓</span></div><div class="metric-value" id="metric-success">—</div><div class="metric-description" id="metric-success-description">尚无请求数据</div></article>
+          <article class="metric-card"><div class="metric-label">平均耗时<span class="metric-icon" aria-hidden="true">◷</span></div><div class="metric-value" id="metric-latency">—</div><div class="metric-description">包括排队与账号重试</div></article>
+        </div>
+
+        <div class="overview-grid">
+          <article class="panel pool-panel">
+            <div class="panel-heading"><div><div class="eyebrow">POOL HEALTH</div><h2>账号状态分布</h2></div><span class="live-tag"><span class="signal-dot"></span>5 秒更新</span></div>
+            <div class="pool-strip" id="pool-strip" aria-label="账号状态分布"></div>
+            <div class="distribution-grid" id="pool-distribution"></div>
+            <div class="queue-line"><span>排队中的请求</span><strong class="mono" id="queue-count">—</strong><span class="queue-caption">按可用账号与频率预算分配</span></div>
+          </article>
+          <article class="panel endpoint-panel">
+            <div class="eyebrow">API ACCESS</div><h2>统一 API 入口</h2><p>在客户端填入以下 Base URL，账号由号池自动分配。</p>
+            <div class="endpoint-field"><input id="api-endpoint" aria-label="API Base URL" readonly spellcheck="false"><button class="copy-button" id="copy-endpoint" type="button" aria-label="复制 API Base URL">复制</button></div>
+            <div class="endpoint-detail"><span>认证密钥</span><code>api_key</code></div><div class="endpoint-detail"><span>接口格式</span><span>OpenAI 兼容</span></div>
+            <div class="endpoint-note">管理密钥仅用于本控制台，调用 API 时请使用独立的 API Key。</div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <div class="panel-heading"><div><div class="eyebrow">ACCOUNT ACTIVITY</div><h2>账号运行状态</h2></div><button class="text-button" data-go-tab="accounts" type="button">管理全部账号 <span aria-hidden="true">↗</span></button></div>
+          <div class="table-scroll"><table><thead><tr><th>账号</th><th>状态</th><th>频率预算</th><th>并发</th><th>尝试成功率</th></tr></thead><tbody id="overview-accounts-body"><tr><td colspan="5" class="empty-cell">连接管理密钥后查看账号。</td></tr></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="page" id="page-accounts" aria-labelledby="accounts-title" hidden>
+        <div class="page-heading"><div><div class="eyebrow">OPERATIONS / ACCOUNTS</div><h1 id="accounts-title">账号管理<span class="heading-dot">.</span></h1><p class="page-description">维护账号凭证，分别设置调用频率、并发与冷却时间。</p></div><button class="button button-primary" id="add-account-button" type="button"><span aria-hidden="true">＋</span> 添加账号</button></div>
+        <div class="account-toolbar"><span id="accounts-count">共 — 个账号</span><button class="text-button refresh-status" type="button">刷新列表 <span aria-hidden="true">↻</span></button></div>
+        <article class="panel account-table-panel"><div class="table-scroll"><table class="accounts-table"><thead><tr><th>账号 / 标识</th><th>状态</th><th>QPS / RPM</th><th>并发</th><th>尝试成功率</th><th>操作</th></tr></thead><tbody id="accounts-body"><tr><td colspan="6" class="empty-cell">尚未加载账号。</td></tr></tbody></table></div></article>
+        <div class="inline-notes"><span><i class="legend-dot status-cooldown"></i>限流账号冷却后自动重新参与调度。</span><span><i class="legend-dot status-invalid"></i>凭证失效或需验证的账号，请更新 Token 后恢复。</span></div>
+      </section>
+
+      <section class="page" id="page-logs" aria-labelledby="logs-title" hidden>
+        <div class="page-heading"><div><div class="eyebrow">OPERATIONS / REQUESTS</div><h1 id="logs-title">请求日志<span class="heading-dot">.</span></h1><p class="page-description">追踪请求结果与账号尝试次数。日志不记录对话正文或凭证。</p></div><button class="button button-secondary" id="refresh-logs" type="button"><span aria-hidden="true">↻</span> 刷新日志</button></div>
+        <form class="log-filters" id="log-filter-form"><label>账号<select id="filter-account"><option value="">全部账号</option></select></label><label>请求结果<select id="filter-outcome"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select></label><button class="button button-primary" type="submit">筛选</button><span class="filter-count" id="log-total">— 条记录</span></form>
+        <div id="logs-retention-note" class="retention-note" role="status" hidden></div>
+        <article class="panel log-table-panel"><div class="table-scroll"><table class="logs-table"><thead><tr><th>请求时间 / ID</th><th>账号</th><th>结果</th><th>耗时</th><th>尝试</th><th>模型 / 模式</th><th>错误类型</th></tr></thead><tbody id="logs-body"><tr><td colspan="7" class="empty-cell">进入此页后加载日志。</td></tr></tbody></table></div><div class="pagination"><span id="log-page-label">第 1 页</span><div><button class="button button-quiet" id="logs-previous" type="button" disabled>← 上一页</button><button class="button button-quiet" id="logs-next" type="button" disabled>下一页 →</button></div></div></article>
+      </section>
+      <footer class="page-footer"><span>ds2api / 私有账号池</span><span id="last-updated">等待连接</span></footer>
+    </main>
+  </div>
+
+  <dialog id="auth-dialog" class="auth-dialog" aria-labelledby="auth-title">
+    <div class="auth-art" aria-hidden="true"><span class="auth-grid-node node-one"></span><span class="auth-grid-node node-two"></span><span class="auth-grid-node node-three"></span><span class="auth-grid-node node-four"></span><span class="auth-art-label">ONE ENDPOINT.<br>YOUR ACCOUNTS.</span></div>
+    <form id="auth-form" class="auth-form">
+      <div class="eyebrow">DS2API / CONTROL ROOM</div><h2 id="auth-title">连接你的号池</h2><p>输入管理密钥，查看运行状态并管理账号。</p>
+      <label for="admin-key">管理密钥</label><input id="admin-key" name="admin-key" type="password" autocomplete="off" required placeholder="请输入 admin_key" spellcheck="false">
+      <div class="form-error" id="auth-error" role="alert" hidden></div>
+      <button class="button button-primary auth-submit" type="submit">连接控制台 <span aria-hidden="true">→</span></button>
+      <div class="auth-footnote">密钥只保留在当前页面内存中，刷新或断开连接后清除。</div>
+    </form>
+  </dialog>
+
+  <dialog id="account-dialog" class="account-dialog" aria-labelledby="account-dialog-title">
+    <form id="account-form">
+      <div class="dialog-heading"><div><div class="eyebrow">ACCOUNT SETTINGS</div><h2 id="account-dialog-title">添加账号</h2></div><button class="icon-button" id="close-account-dialog" type="button" aria-label="关闭账号设置">×</button></div>
+      <div class="dialog-content">
+        <div class="field-grid"><label>账号名称<input name="name" maxlength="80" required placeholder="例如：日常使用"></label><label>账号标识 <span class="optional">可选</span><input name="id" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" placeholder="留空自动生成" spellcheck="false"><span class="field-help">字母或数字开头，支持点、下划线和连字符</span></label></div>
+        <label>DeepSeek Token<input name="token" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴账号 Token"><span class="field-help" id="token-help">凭证仅用于上游请求，不会在列表中回显。</span></label>
+        <label>Token 到期时间 <span class="optional">可选</span><input name="token_expires_at" type="datetime-local"><span class="field-help">知道准确到期时间时填写；留空则依据上游响应判断。</span></label>
+        <div class="form-section-heading"><span>请求预算</span><span>每个账号独立生效</span></div>
+        <div class="field-grid field-grid-three"><label>QPS<input name="qps" type="number" min="1" step="1" value="1" required><span class="field-help">过去 1 秒内请求数</span></label><label>RPM<input name="rpm" type="number" min="1" step="1" value="20" required><span class="field-help">过去 60 秒内请求数</span></label><label>最大并发<input name="max_concurrent" type="number" min="1" step="1" value="1" required><span class="field-help">同时处理的请求数</span></label></div>
+        <div class="field-grid"><label>基础冷却 / 秒<input name="cooldown_seconds" type="number" min="1" step="1" value="60" required></label><label>最长冷却 / 秒<input name="max_cooldown_seconds" type="number" min="1" step="1" value="900" required></label></div>
+        <div class="field-help cooldown-help">连续限流时延长冷却，直到达到上限；上游要求更长等待时遵循上游。</div>
+        <label class="checkbox-field"><input name="enabled" type="checkbox" checked><span>启用账号，允许参与自动调度</span></label>
+        <div class="form-error" id="account-error" role="alert" hidden></div>
+      </div>
+      <div class="dialog-actions"><button class="button button-secondary" id="cancel-account-dialog" type="button">取消</button><button class="button button-primary" id="save-account-button" type="submit">保存账号</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

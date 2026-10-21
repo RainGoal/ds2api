@@ -3,3 +3,8 @@ server.pid
 *.log
 config.json
 assets/
+data/
+output/
+.playwright-cli/
+*.tmp
+.env

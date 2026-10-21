@@ -14,8 +14,10 @@
 const fs = require('fs');
 const path = require('path');
 const { DeepSeekClient, UpstreamError } = require('./lib/dsweb');
+const { ConfigStore } = require('./lib/config');
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+const CONFIG_PATH = path.resolve(process.env.DS_CONFIG_PATH || path.join(__dirname, 'config.json'));
+const configStore = new ConfigStore(CONFIG_PATH);
 
 function loadConfig() {
   try {
@@ -23,18 +25,32 @@ function loadConfig() {
       fs.copyFileSync(path.join(__dirname, 'config.example.json'), CONFIG_PATH);
       console.log('[提示] 已从 config.example.json 生成 config.json');
     }
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+    return configStore.read();
   } catch (e) {
     console.error(`[错误] 无法读取 config.json: ${e.message}`);
     process.exit(1);
   }
 }
 
-function saveToken(token) {
+function saveToken(token, accountId) {
   const cfg = loadConfig();
+  if (accountId) {
+    const accounts = configStore.accounts(cfg);
+    const existing = accounts.find((account) => account.id === accountId);
+    if (existing) {
+      existing.token = token;
+      existing.token_expires_at = null;
+    } else {
+      accounts.push({ id: accountId, name: accountId, token, device_id: require('crypto').randomUUID() });
+    }
+    configStore.saveAccounts(accounts);
+    console.log('[OK] 账号 ' + accountId + ' 的 token 已更新，运行中的服务会自动加载');
+    return;
+  }
+  if (Array.isArray(cfg.accounts)) throw new Error('号池模式请指定 --account <账号ID>，或在 /admin 更新 Token');
   cfg.token = token;
   if (!cfg.device_id) cfg.device_id = require('crypto').randomUUID();
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', 'utf-8');
+  configStore.write(cfg);
   console.log(`[OK] token 已写入 config.json（长度 ${token.length}）`);
 }
 
@@ -50,6 +66,15 @@ function clientOpts(cfg) {
 
 async function main() {
   const args = process.argv.slice(2);
+  const accountIndex = args.indexOf('--account');
+  let accountId;
+  if (accountIndex >= 0) {
+    accountId = args[accountIndex + 1];
+    if (!accountId || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(accountId)) {
+      throw new Error('--account 后需要合法的账号 ID');
+    }
+    args.splice(accountIndex, 2);
+  }
 
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
     console.log(`用法：
@@ -57,18 +82,25 @@ async function main() {
   node login.js --phone <手机号> <密码>    手机号登录（默认 +86）
   node login.js --token <token>            手动粘贴 token
   node login.js --show                     查看当前状态`);
+    console.log('号池：追加 --account <账号ID>，例如 node login.js --account work --token <token>');
     return;
   }
 
   if (args.includes('--show')) {
     const cfg = loadConfig();
+    for (const account of configStore.accounts(cfg)) {
+      console.log('账号: ' + account.id + ' / ' + account.name + ' / token ' + (account.token ? '已配置' : '未配置'));
+    }
     console.log(`base_url: ${cfg.base_url || 'https://chat.deepseek.com'}`);
-    console.log(`token:    ${cfg.token ? `已配置（长度 ${cfg.token.length}，前 8 位 ${cfg.token.slice(0, 8)}…）` : '未配置'}`);
+    console.log('token:    ' + (cfg.token ? '已配置' : '使用上面的账号列表'));
     console.log(`port:     ${cfg.port || 3000}`);
     return;
   }
 
   const cfg = loadConfig();
+  if (Array.isArray(cfg.accounts) && !accountId) {
+    throw new Error('号池模式请指定 --account <账号ID>，或在 /admin 更新 Token');
+  }
 
   if (args.includes('--token')) {
     const token = args[args.indexOf('--token') + 1];
@@ -76,7 +108,7 @@ async function main() {
       console.error('[错误] --token 后需要跟 token 字符串');
       process.exit(1);
     }
-    saveToken(token);
+    saveToken(token, accountId);
     return;
   }
 
@@ -101,7 +133,7 @@ async function main() {
   console.log('正在登录 DeepSeek 网页版…');
   try {
     const token = await DeepSeekClient.login(loginArgs);
-    saveToken(token);
+    saveToken(token, accountId);
     console.log('登录成功 ✔  现在可以运行 start.bat 启动代理');
   } catch (e) {
     if (e instanceof UpstreamError) {
@@ -116,4 +148,7 @@ async function main() {
   }
 }
 
-main();
+main().catch((error) => {
+  console.error('[错误] ' + error.message);
+  process.exitCode = 1;
+});
